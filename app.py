@@ -1,16 +1,44 @@
+
+import os
+import logging
+
+# Limit TensorFlow CPU threads on small hosting instances.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+
 from flask import Flask, render_template_string, request
 import joblib
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras.models import load_model
 
 from PreProcessing import clean_doc
 
-app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Load the trained model and saved preprocessing objects
-model = load_model("sentiment_ann.h5")
-vectorizer = joblib.load("sentiment_vectorizer.joblib")
-label_encoder = joblib.load("sentiment_label_encoder.joblib")
+app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Configure TensorFlow before loading the model.
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+
+# Load model and preprocessing files.
+app.logger.info("Loading sentiment ANN model...")
+model = load_model(
+    os.path.join(BASE_DIR, "sentiment_ann.h5"),
+    compile=False
+)
+app.logger.info("ANN model loaded.")
+
+vectorizer = joblib.load(
+    os.path.join(BASE_DIR, "sentiment_vectorizer.joblib")
+)
+label_encoder = joblib.load(
+    os.path.join(BASE_DIR, "sentiment_label_encoder.joblib")
+)
+app.logger.info("Preprocessing objects loaded.")
 
 HTML = """
 <!DOCTYPE html>
@@ -59,6 +87,10 @@ button:hover { background: #5b21b6; }
 .fill { height: 100%; background: #8b5cf6; }
 .error { color: #b91c1c; margin-top: 16px; }
 footer { margin-top: 26px; color: #9ca3af; font-size: 12px; text-align: center; }
+@media (max-width: 520px) {
+    .card { padding: 24px 20px; }
+    h1 { font-size: 28px; }
+}
 </style>
 </head>
 <body>
@@ -100,6 +132,12 @@ footer { margin-top: 26px; color: #9ca3af; font-size: 12px; text-align: center; 
 </html>
 """
 
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "model_loaded": model is not None}, 200
+
+
 @app.route("/", methods=["GET", "POST"])
 def home():
     review = ""
@@ -108,31 +146,66 @@ def home():
     error = None
 
     if request.method == "POST":
+        app.logger.info("Prediction request received.")
         review = request.form.get("review", "").strip()
 
         if not review:
             error = "Please enter a review."
         else:
-            cleaned_review = " ".join(clean_doc(review))
+            try:
+                app.logger.info("Cleaning review.")
+                cleaned_review = " ".join(clean_doc(review))
 
-            if not cleaned_review:
-                error = "Please enter a review containing recognizable words."
-            else:
-                features = vectorizer.transform([cleaned_review]).toarray()
-                output = model.predict(features, verbose=0)[0]
-                index = int(np.argmax(output))
-                prediction = str(label_encoder.inverse_transform([index])[0])
+                if not cleaned_review:
+                    error = "Please enter a review containing recognizable words."
+                else:
+                    app.logger.info("Transforming review.")
+                    features = vectorizer.transform(
+                        [cleaned_review]
+                    ).toarray().astype(np.float32, copy=False)
 
-                scores = [
-                    {"label": str(label), "score": float(output[i])}
-                    for i, label in enumerate(label_encoder.classes_)
-                ]
-                scores.sort(key=lambda item: item["score"], reverse=True)
+                    app.logger.info(
+                        "Running ANN inference. Input shape: %s",
+                        features.shape
+                    )
+
+                    # Call the model directly for inference.
+                    output = model(features, training=False).numpy()[0]
+                    app.logger.info("ANN inference completed.")
+
+                    index = int(np.argmax(output))
+                    prediction = str(
+                        label_encoder.inverse_transform([index])[0]
+                    )
+
+                    scores = [
+                        {
+                            "label": str(label),
+                            "score": float(output[i])
+                        }
+                        for i, label in enumerate(label_encoder.classes_)
+                    ]
+                    scores.sort(
+                        key=lambda item: item["score"],
+                        reverse=True
+                    )
+
+                    app.logger.info(
+                        "Prediction completed: %s", prediction
+                    )
+
+            except Exception:
+                app.logger.exception("Prediction failed.")
+                error = "Prediction failed. Please try again. Check application logs if the problem continues."
 
     return render_template_string(
-        HTML, review=review, prediction=prediction,
-        scores=scores, error=error
+        HTML,
+        review=review,
+        prediction=prediction,
+        scores=scores,
+        error=error
     )
+
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=False)
